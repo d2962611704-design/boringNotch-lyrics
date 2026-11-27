@@ -25,6 +25,15 @@ jobs:
         run: |
           xcodebuild -project boringNotch.xcodeproj -scheme boringNotch -configuration Release -derivedDataPath build CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" build
 
+      - name: Re-sign app bundle
+        run: |
+          # Cloud builds are ad-hoc signed (CODE_SIGN_IDENTITY="-"), so the main
+          # binary has no Team ID while the embedded MediaRemoteAdapter framework
+          # still carries the upstream developer signature. dyld refuses to load
+          # it at launch (build 3 crashed 10/10 times on first launch). Re-sign
+          # the whole bundle so every binary shares the same ad-hoc identity.
+          codesign --force --deep --sign - build/Build/Products/Release/boringNotch.app
+
       - name: Package
         run: |
           APP="build/Build/Products/Release/boringNotch.app"
@@ -41,4 +50,4 @@ jobs:
           name: Boring Notch 2.7.3 + synced lyrics (build ${{ github.run_number }})
           files: boringNotch-lyrics.zip
           body: |
-            Custom build of Boring Notch 2.7.3 with reliable synced lyrics for Spotify (LRCLIB exact match, per-track cache, stale-fetch guard, robust LRC parsing, lyrics stay visible when paused, next line preview). Built from this repo's main branch.
+            Custom build of Boring Notch 2.7.3 with reliable synced lyrics for Spotify (LRCLIB exact match, per-track cache, stale-fetch guard, robust LRC parsing, lyrics stay visible when paused). Lyrics now render as one large karaoke line filling the expanded notch, filled word by word as the song plays. Built from this repo's main branch.

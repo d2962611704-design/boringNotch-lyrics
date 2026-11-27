@@ -205,48 +205,21 @@ struct MusicControlsView: View {
                         let progressed = musicManager.elapsedTime + (delta * musicManager.playbackRate)
                         return min(max(progressed, 0), musicManager.songDuration)
                     }()
-                    let line: String = {
-                        if musicManager.isFetchingLyrics { return "Loading lyrics…" }
-                        if !musicManager.syncedLyrics.isEmpty {
-                            return musicManager.lyricLine(at: currentElapsed)
-                        }
-                        let trimmed = musicManager.currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-                        return trimmed.isEmpty ? "No lyrics found" : trimmed.replacingOccurrences(of: "\n", with: " ")
-                    }()
-                    // Next synced line, shown under the current one (empty while loading or without synced lyrics)
-                    let nextLine: String = {
-                        guard !musicManager.isFetchingLyrics, !musicManager.syncedLyrics.isEmpty else { return "" }
-                        return musicManager.nextLyricLine(at: currentElapsed)
-                    }()
-                    let isPersian = line.unicodeScalars.contains { scalar in
+                    let attributedLine = musicManager.lyricAttributedLine(at: currentElapsed)
+                    let plainLine = String(attributedLine.characters)
+                    let isPersian = plainLine.unicodeScalars.contains { scalar in
                         let v = scalar.value
                         return v >= 0x0600 && v <= 0x06FF
                     }
-                    VStack(alignment: .leading, spacing: 0) {
-                        MarqueeText(
-                            .constant(line),
-                            font: .subheadline,
-                            nsFont: .subheadline,
-                            textColor: musicManager.isFetchingLyrics ? .gray.opacity(0.7) : .gray,
-                            frameWidth: width
-                        )
-                        .font(isPersian ? .custom("Vazirmatn-Regular", size: NSFont.preferredFont(forTextStyle: .subheadline).pointSize) : .subheadline)
+                    // Single large karaoke line: sung part bright white, rest dimmed gray
+                    Text(attributedLine)
+                        .font(isPersian ? .custom("Vazirmatn-Regular", size: 28) : .system(size: 28, weight: .semibold))
                         .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
                         // Paused lyrics stay visible, only slightly dimmed
                         .opacity(musicManager.isPlaying ? 1 : 0.85)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                        if !nextLine.isEmpty {
-                            MarqueeText(
-                                .constant(nextLine),
-                                font: .caption,
-                                nsFont: .caption1,
-                                textColor: .gray.opacity(0.55),
-                                frameWidth: width
-                            )
-                            .lineLimit(1)
-                            .opacity(musicManager.isPlaying ? 0.8 : 0.7)
-                        }
-                    }
                 }
             }
         }

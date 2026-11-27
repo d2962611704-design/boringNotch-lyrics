@@ -14,6 +14,10 @@ let defaultImage: NSImage = .init(
     accessibilityDescription: "Album Art"
 )!
 
+/// One synced lyric line: start time, text, and per-word timings (word start, word text).
+/// Word end is derived from the next word's start (last word ends at the line end).
+typealias SyncedLyricLine = (time: Double, text: String, words: [(time: Double, text: String)])
+
 class MusicManager: ObservableObject {
     // MARK: - Properties
     static let shared = MusicManager()
@@ -50,11 +54,11 @@ class MusicManager: ObservableObject {
     @Published var usingAppIconForArtwork: Bool = false
     @Published var currentLyrics: String = ""
     @Published var isFetchingLyrics: Bool = false
-    @Published var syncedLyrics: [(time: Double, text: String)] = []
+    @Published var syncedLyrics: [SyncedLyricLine] = []
     // Generation guard: responses from a previous track are dropped instead of overwriting the new track's lyrics
     private var lyricsFetchGeneration = 0
     // In-memory cache of resolved lyrics, keyed by track identity (title + artist + album + duration)
-    private var lyricsCache: [String: (plain: String, synced: [(time: Double, text: String)])] = [:]
+    private var lyricsCache: [String: (plain: String, synced: [SyncedLyricLine])] = [:]
     @Published var canFavoriteTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
 
@@ -479,7 +483,9 @@ class MusicManager: ObservableObject {
             let plain = (best["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let synced = (best["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let resolved = plain.isEmpty ? synced : plain
-            applyLyricsResult(plain: resolved, synced: parseLRC(synced), generation: generation, cacheKey: cacheKey)
+            let lyricsFile = (best["lyricsfile"] as? String) ?? ""
+            let wordsByLine = parseLyricsFileWords(lyricsFile)
+            applyLyricsResult(plain: resolved, synced: parseLRC(synced, wordsByLineStart: wordsByLine), generation: generation, cacheKey: cacheKey)
         } catch {
             // One retry after a short delay, only while this is still the current track
             guard !isRetry else {
@@ -494,7 +500,7 @@ class MusicManager: ObservableObject {
 
     /// Fetches lyrics from an LRCLIB endpoint returning a single JSON object (e.g. /api/get).
     /// Returns nil on 404, non-200, network error, or when the track has no lyrics here.
-    private func fetchLyricsResult(from urlString: String) async -> (plain: String, synced: [(time: Double, text: String)])? {
+    private func fetchLyricsResult(from urlString: String) async -> (plain: String, synced: [SyncedLyricLine])? {
         guard let url = URL(string: urlString) else { return nil }
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
@@ -504,7 +510,9 @@ class MusicManager: ObservableObject {
             let synced = (json["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !plain.isEmpty || !synced.isEmpty else { return nil }
             // Prefer plain lyrics (syncedLyrics may also be present)
-            return (plain.isEmpty ? synced : plain, parseLRC(synced))
+            let lyricsFile = (json["lyricsfile"] as? String) ?? ""
+            let wordsByLine = parseLyricsFileWords(lyricsFile)
+            return (plain.isEmpty ? synced : plain, parseLRC(synced, wordsByLineStart: wordsByLine))
         } catch {
             return nil
         }
@@ -539,7 +547,7 @@ class MusicManager: ObservableObject {
 
     /// Writes a fetched lyrics result, dropping it when a newer track has started meanwhile.
     @MainActor
-    private func applyLyricsResult(plain: String, synced: [(time: Double, text: String)], generation: Int, cacheKey: String? = nil) {
+    private func applyLyricsResult(plain: String, synced: [SyncedLyricLine], generation: Int, cacheKey: String? = nil) {
         guard generation == lyricsFetchGeneration else { return }
         if let cacheKey = cacheKey {
             lyricsCache[cacheKey] = (plain: plain, synced: synced)
@@ -550,8 +558,8 @@ class MusicManager: ObservableObject {
     }
 
     // MARK: - Synced lyrics helpers
-    private func parseLRC(_ lrc: String) -> [(time: Double, text: String)] {
-        var result: [(time: Double, text: String)] = []
+    private func parseLRC(_ lrc: String, wordsByLineStart: [Double: [(time: Double, text: String)]] = [:]) -> [SyncedLyricLine] {
+        var result: [SyncedLyricLine] = []
         // \r\n safe: split on any newline sequence
         let lines = lrc.components(separatedBy: CharacterSet.newlines)
 
@@ -598,15 +606,94 @@ class MusicManager: ObservableObject {
                 let fractionValue = Double(fraction) ?? 0
                 let divisor = pow(10.0, Double(fraction.count))
                 let time = max(0, minutes * 60 + seconds + fractionValue / divisor + offsetSeconds)
-                result.append((time, text))
+                result.append((time: time, text: text, words: []))
             }
         }
-        return result.sorted { $0.0 < $1.0 }
+        let sorted = result.sorted { $0.time < $1.time }
+        // Merge per-word timings from the lyricsfile: match each LRC line to the closest
+        // lyricsfile line start (±0.6s); lines without a match keep empty words.
+        guard !wordsByLineStart.isEmpty else { return sorted }
+        var remaining = wordsByLineStart
+        return sorted.map { line in
+            guard let key = remaining.keys.min(by: { abs($0 - line.time) < abs($1 - line.time) }),
+                  abs(key - line.time) <= 0.6,
+                  let words = remaining.removeValue(forKey: key) else { return line }
+            return (time: line.time, text: line.text, words: words)
+        }
     }
 
-    func lyricLine(at elapsed: Double) -> String {
-        guard !syncedLyrics.isEmpty else { return currentLyrics }
-        // Binary search for last line with time <= elapsed
+    /// Parses LRCLIB `lyricsfile` YAML into per-line word timings.
+    /// Returns a dictionary keyed by line start time (seconds) -> [(word start in seconds, word text)].
+    /// Layout: top-level `- text:` / `start_ms:` per line, then a `words:` list of
+    /// `- text: '...'` / `start_ms:` items. Anything unrecognized is skipped; never throws.
+    private func parseLyricsFileWords(_ yaml: String) -> [Double: [(time: Double, text: String)]] {
+        var result: [Double: [(time: Double, text: String)]] = [:]
+        var lineStart: Double? = nil
+        var words: [(time: Double, text: String)] = []
+        var inWords = false
+        var pendingWordText: String? = nil
+
+        func flushLine() {
+            if let start = lineStart {
+                result[start] = words
+            }
+            lineStart = nil
+            words = []
+            inWords = false
+            pendingWordText = nil
+        }
+
+        for rawLine in yaml.components(separatedBy: .newlines) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            let indent = rawLine.prefix(while: { $0 == " " }).count
+
+            if trimmed == "words:" {
+                inWords = true
+                continue
+            }
+            if trimmed.hasPrefix("- text:") {
+                let value = unquoteYAMLString(String(trimmed.dropFirst("- text:".count)).trimmingCharacters(in: .whitespaces))
+                if indent == 0 {
+                    // New lyric line at the top level
+                    flushLine()
+                } else if inWords {
+                    // New word; a previous word without start_ms is dropped (no timing to use)
+                    pendingWordText = value
+                }
+                continue
+            }
+            if trimmed.hasPrefix("start_ms:") {
+                let msText = String(trimmed.dropFirst("start_ms:".count)).trimmingCharacters(in: .whitespaces)
+                guard let ms = Double(msText) else { continue }
+                if inWords, let wordText = pendingWordText {
+                    words.append((time: ms / 1000.0, text: wordText))
+                    pendingWordText = nil
+                } else if !inWords {
+                    lineStart = ms / 1000.0
+                }
+                continue
+            }
+            // end_ms: and everything else is ignored
+        }
+        flushLine()
+        return result
+    }
+
+    /// Strips a YAML scalar's surrounding quotes; YAML doubles a single quote to escape it ('').
+    private func unquoteYAMLString(_ value: String) -> String {
+        guard value.count >= 2 else { return value }
+        if value.hasPrefix("'"), value.hasSuffix("'") {
+            return String(value.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
+        }
+        if value.hasPrefix("\""), value.hasSuffix("\"") {
+            return String(value.dropFirst().dropLast()).replacingOccurrences(of: "\\\"", with: "\"")
+        }
+        return value
+    }
+
+    /// Index of the synced line playing at `elapsed` (last line with time <= elapsed)
+    private func syncedLineIndex(at elapsed: Double) -> Int {
         var low = 0
         var high = syncedLyrics.count - 1
         var idx = 0
@@ -619,27 +706,86 @@ class MusicManager: ObservableObject {
                 high = mid - 1
             }
         }
-        return syncedLyrics[idx].text
+        return idx
     }
 
-    /// The first synced line after the one playing at `elapsed` ("" when there is none)
-    func nextLyricLine(at elapsed: Double) -> String {
-        guard !syncedLyrics.isEmpty else { return "" }
-        // Same binary search as lyricLine(at:): idx is the current line
-        var low = 0
-        var high = syncedLyrics.count - 1
-        var idx = 0
-        while low <= high {
-            let mid = (low + high) / 2
-            if syncedLyrics[mid].time <= elapsed {
-                idx = mid
-                low = mid + 1
-            } else {
-                high = mid - 1
+    /// The current lyric line as an attributed string: sung characters in bright white,
+    /// not-yet-sung characters dimmed gray — karaoke-style fill, refreshed by the view's
+    /// TimelineView. Falls back to plain lyrics when no synced lines exist.
+    func lyricAttributedLine(at elapsed: Double) -> AttributedString {
+        if isFetchingLyrics {
+            var line = AttributedString("Loading lyrics…")
+            line.foregroundColor = .gray
+            return line
+        }
+        guard !syncedLyrics.isEmpty else {
+            let trimmed = currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                var line = AttributedString("No lyrics found")
+                line.foregroundColor = .gray
+                return line
+            }
+            var line = AttributedString(trimmed.replacingOccurrences(of: "\n", with: " "))
+            line.foregroundColor = .white
+            return line
+        }
+
+        let idx = syncedLineIndex(at: elapsed)
+        let line = syncedLyrics[idx]
+        let lineStart = line.time
+        let lineEnd = max(lineStart, idx + 1 < syncedLyrics.count ? syncedLyrics[idx + 1].time : songDuration)
+
+        // Start time of every character in the line, for the sung/unsung split
+        let chars = Array(line.text)
+        guard !chars.isEmpty else { return AttributedString("") }
+        var charStarts: [Double] = []
+        charStarts.reserveCapacity(chars.count)
+        if !line.words.isEmpty {
+            // Word timings: a word spans [start, next word start); the last word ends at the line end.
+            // Characters inside a word are spread evenly across the word's span.
+            for (wordIndex, word) in line.words.enumerated() {
+                let wordStart = word.time
+                let rawEnd = wordIndex + 1 < line.words.count ? line.words[wordIndex + 1].time : lineEnd
+                let wordEnd = max(wordStart, rawEnd)
+                let count = word.text.count
+                guard count > 0 else { continue }
+                for i in 0..<count {
+                    charStarts.append(wordStart + (wordEnd - wordStart) * Double(i) / Double(count))
+                }
+            }
+            // The word texts may not cover the whole line (e.g. separators between words):
+            // reconcile the count so every line character has a start time.
+            while charStarts.count < chars.count {
+                charStarts.append(lineEnd)
+            }
+            while charStarts.count > chars.count {
+                charStarts.removeLast()
+            }
+        } else {
+            // No word timings: spread the whole line evenly over [lineStart, lineEnd)
+            for i in 0..<chars.count {
+                charStarts.append(lineStart + (lineEnd - lineStart) * Double(i) / Double(chars.count))
             }
         }
-        let nextIndex = idx + 1
-        return nextIndex < syncedLyrics.count ? syncedLyrics[nextIndex].text : ""
+
+        var result = AttributedString()
+        var runStart = 0
+        var runSung = elapsed >= charStarts[0]
+        func flushRun(upTo end: Int) {
+            var run = AttributedString(String(chars[runStart..<end]))
+            run.foregroundColor = runSung ? .white : .gray.opacity(0.45)
+            result.append(run)
+        }
+        for i in 1..<chars.count {
+            let sung = elapsed >= charStarts[i]
+            if sung != runSung {
+                flushRun(upTo: i)
+                runStart = i
+                runSung = sung
+            }
+        }
+        flushRun(upTo: chars.count)
+        return result
     }
 
     private func triggerFlipAnimation() {
