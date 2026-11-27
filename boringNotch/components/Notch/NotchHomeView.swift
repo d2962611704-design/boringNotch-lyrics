@@ -198,28 +198,71 @@ struct MusicControlsView: View {
             )
             .fontWeight(.medium)
             if Defaults[.enableLyrics] {
-                TimelineView(.animation(minimumInterval: 0.25)) { timeline in
+                TimelineView(.animation) { timeline in
                     let currentElapsed: Double = {
                         guard musicManager.isPlaying else { return musicManager.elapsedTime }
                         let delta = timeline.date.timeIntervalSince(musicManager.timestampDate)
                         let progressed = musicManager.elapsedTime + (delta * musicManager.playbackRate)
                         return min(max(progressed, 0), musicManager.songDuration)
                     }()
-                    let attributedLine = musicManager.lyricAttributedLine(at: currentElapsed)
-                    let plainLine = String(attributedLine.characters)
-                    let isPersian = plainLine.unicodeScalars.contains { scalar in
-                        let v = scalar.value
-                        return v >= 0x0600 && v <= 0x06FF
-                    }
-                    // Single large karaoke line: sung part bright white, rest dimmed gray
-                    Text(attributedLine)
-                        .font(isPersian ? .custom("Vazirmatn-Regular", size: 28) : .system(size: 28, weight: .semibold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
+                    if let fillLine = musicManager.lyricLineFill(at: currentElapsed) {
+                        // Continuous fill: the sung boundary sweeps smoothly across the line,
+                        // lighting the current word in proportion instead of flipping whole words.
+                        let isPersian = fillLine.text.unicodeScalars.contains { scalar in
+                            let v = scalar.value
+                            return v >= 0x0600 && v <= 0x06FF
+                        }
+                        let f = CGFloat(min(max(fillLine.fill, 0), 1))
+                        let unsung = Color.gray.opacity(0.45)
+                        // Gradient stops are built in non-decreasing location order for any f:
+                        // white from 0 to f, then a short feather into gray, gray to 1.
+                        var stops: [Gradient.Stop] = [Gradient.Stop(color: .white, location: 0)]
+                        if f > 0 {
+                            stops.append(Gradient.Stop(color: .white, location: f))
+                        }
+                        let featherEnd = min(1, f + 0.02)
+                        if featherEnd > f {
+                            stops.append(Gradient.Stop(color: unsung, location: featherEnd))
+                        }
+                        if featherEnd < 1 {
+                            stops.append(Gradient.Stop(color: unsung, location: 1))
+                        }
+                        // The gradient must map to the text's own width, not the row's: a
+                        // full-width frame on the Text itself would stretch the gradient
+                        // across the whole row and the fill would run ahead of the singing.
+                        // So the Text stays content-sized inside an HStack; the frame goes
+                        // on the HStack instead.
+                        HStack(spacing: 0) {
+                            Text(fillLine.text)
+                                .font(isPersian ? .custom("Vazirmatn-Regular", size: 28) : .system(size: 28, weight: .semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.5)
+                                .foregroundStyle(LinearGradient(gradient: Gradient(stops: stops), startPoint: .leading, endPoint: .trailing))
+                            Spacer(minLength: 0)
+                        }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 8)
                         // Paused lyrics stay visible, only slightly dimmed
                         .opacity(musicManager.isPlaying ? 1 : 0.85)
+                    } else {
+                        // No fill data (loading / no lyrics / unsynced lyrics): keep the
+                        // original per-character karaoke rendering as the fallback.
+                        let attributedLine = musicManager.lyricAttributedLine(at: currentElapsed)
+                        let plainLine = String(attributedLine.characters)
+                        let isPersian = plainLine.unicodeScalars.contains { scalar in
+                            let v = scalar.value
+                            return v >= 0x0600 && v <= 0x06FF
+                        }
+                        // Single large karaoke line: sung part bright white, rest dimmed gray
+                        Text(attributedLine)
+                            .font(isPersian ? .custom("Vazirmatn-Regular", size: 28) : .system(size: 28, weight: .semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 8)
+                            // Paused lyrics stay visible, only slightly dimmed
+                            .opacity(musicManager.isPlaying ? 1 : 0.85)
+                    }
                 }
             }
         }

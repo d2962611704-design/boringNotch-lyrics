@@ -18,6 +18,15 @@ let defaultImage: NSImage = .init(
 /// Word end is derived from the next word's start (last word ends at the line end).
 typealias SyncedLyricLine = (time: Double, text: String, words: [(time: Double, text: String)])
 
+/// Measured width layout for one synced lyric line, backing the continuous fill:
+/// each span covers one word (plus the gap after it) with its time window, so the
+/// fill boundary sweeps across spans in proportion to their rendered widths.
+private struct LyricFillLayout {
+    let text: String
+    let totalWidth: CGFloat
+    let spans: [(start: Double, end: Double, width: CGFloat)]
+}
+
 class MusicManager: ObservableObject {
     // MARK: - Properties
     static let shared = MusicManager()
@@ -59,6 +68,9 @@ class MusicManager: ObservableObject {
     private var lyricsFetchGeneration = 0
     // In-memory cache of resolved lyrics, keyed by track identity (title + artist + album + duration)
     private var lyricsCache: [String: (plain: String, synced: [SyncedLyricLine])] = [:]
+    // Measured width layouts for lyricLineFill, keyed by line start time (validated
+    // against the line text, so a new song reusing a start time rebuilds its layout)
+    private var lyricFillLayoutCache: [Double: LyricFillLayout] = [:]
     @Published var canFavoriteTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
 
@@ -554,6 +566,7 @@ class MusicManager: ObservableObject {
         }
         self.currentLyrics = plain
         self.syncedLyrics = synced
+        self.lyricFillLayoutCache.removeAll()
         self.isFetchingLyrics = false
     }
 
@@ -786,6 +799,113 @@ class MusicManager: ObservableObject {
         }
         flushRun(upTo: chars.count)
         return result
+    }
+
+    /// The current lyric line with a continuous fill fraction (0...1) across the line's
+    /// rendered width: the sung boundary sweeps smoothly through the line, lighting
+    /// the word being sung in proportion instead of flipping whole words at once.
+    /// Returns nil while loading, when there are no lyrics, or when the lyrics have
+    /// no sync timings — the caller falls back to lyricAttributedLine in those cases.
+    /// Word widths are measured once per line (28pt semibold / Vazirmatn, matching the
+    /// view) and cached by line start time.
+    func lyricLineFill(at elapsed: Double) -> (text: String, fill: Double)? {
+        guard !isFetchingLyrics, !syncedLyrics.isEmpty else { return nil }
+        let idx = syncedLineIndex(at: elapsed)
+        let line = syncedLyrics[idx]
+        let lineStart = line.time
+        let lineEnd = max(lineStart, idx + 1 < syncedLyrics.count ? syncedLyrics[idx + 1].time : songDuration)
+        guard !line.text.isEmpty else { return ("", 0) }
+        guard lineEnd > lineStart else { return (line.text, elapsed >= lineStart ? 1 : 0) }
+
+        if line.words.isEmpty {
+            // No word timings: sweep the whole line uniformly over [lineStart, lineEnd)
+            let fill = (elapsed - lineStart) / (lineEnd - lineStart)
+            return (line.text, min(max(fill, 0), 1))
+        }
+
+        let layout = fillLayout(for: line, lineEnd: lineEnd)
+        guard layout.totalWidth > 0, !layout.spans.isEmpty else {
+            let fill = (elapsed - lineStart) / (lineEnd - lineStart)
+            return (line.text, min(max(fill, 0), 1))
+        }
+        var sungWidth: CGFloat = 0
+        for span in layout.spans {
+            if elapsed >= span.end {
+                sungWidth += span.width
+            } else if elapsed >= span.start {
+                let duration = max(span.end - span.start, 0.001)
+                sungWidth += span.width * CGFloat(min(max((elapsed - span.start) / duration, 0), 1))
+                break
+            } else {
+                break
+            }
+        }
+        return (line.text, min(max(Double(sungWidth / layout.totalWidth), 0), 1))
+    }
+
+    /// The font the lyric line is rendered in, matching the view (28pt semibold,
+    /// Vazirmatn for Persian lines), used to measure word widths.
+    private func lyricFillFont(for text: String) -> NSFont {
+        let isPersian = text.unicodeScalars.contains { $0.value >= 0x0600 && $0.value <= 0x06FF }
+        if isPersian, let vazirmatn = NSFont(name: "Vazirmatn-Regular", size: 28) {
+            return vazirmatn
+        }
+        return NSFont.systemFont(ofSize: 28, weight: .semibold)
+    }
+
+    /// Width layout for one line: one span per word, each span's width measured with
+    /// the display font. The gap between two words (usually a single space) is sung
+    /// while the preceding word is sung, so its width rides on the preceding span;
+    /// a leading gap gets its own span before the first word, and trailing text
+    /// rides on the last span. This keeps the fill boundary moving continuously
+    /// across the whole line span [lineStart, lineEnd).
+    private func fillLayout(for line: SyncedLyricLine, lineEnd: Double) -> LyricFillLayout {
+        if let cached = lyricFillLayoutCache[line.time], cached.text == line.text {
+            return cached
+        }
+        let font = lyricFillFont(for: line.text)
+        func width(of string: String) -> CGFloat {
+            guard !string.isEmpty else { return 0 }
+            return (string as NSString).size(withAttributes: [.font: font]).width
+        }
+        let spaceWidth = width(of: " ")
+        var spans: [(start: Double, end: Double, width: CGFloat)] = []
+        var cursor = line.text.startIndex
+        var searchFrom = line.text.startIndex
+        for (index, word) in line.words.enumerated() {
+            guard !word.text.isEmpty else { continue }
+            let wordStart = word.time
+            let wordEnd = max(wordStart, index + 1 < line.words.count ? line.words[index + 1].time : lineEnd)
+            let wordWidth = width(of: word.text)
+            if let range = line.text.range(of: word.text, options: [], range: searchFrom..<line.text.endIndex) {
+                let gap = String(line.text[cursor..<range.lowerBound])
+                let gapWidth = width(of: gap)
+                if index == 0 {
+                    if gapWidth > 0 {
+                        spans.append((start: line.time, end: wordStart, width: gapWidth))
+                    }
+                } else if gapWidth > 0, !spans.isEmpty {
+                    spans[spans.count - 1].width += gapWidth
+                }
+                spans.append((start: wordStart, end: wordEnd, width: wordWidth))
+                cursor = range.upperBound
+                searchFrom = range.upperBound
+            } else {
+                // Word text not found in the line (punctuation differs between sources):
+                // assume a single space separates it from the previous word.
+                if !spans.isEmpty {
+                    spans[spans.count - 1].width += spaceWidth
+                }
+                spans.append((start: wordStart, end: wordEnd, width: wordWidth))
+            }
+        }
+        if cursor < line.text.endIndex, !spans.isEmpty {
+            spans[spans.count - 1].width += width(of: String(line.text[cursor...]))
+        }
+        let totalWidth = spans.reduce(0) { $0 + $1.width }
+        let layout = LyricFillLayout(text: line.text, totalWidth: totalWidth, spans: spans)
+        lyricFillLayoutCache[line.time] = layout
+        return layout
     }
 
     private func triggerFlipAnimation() {
