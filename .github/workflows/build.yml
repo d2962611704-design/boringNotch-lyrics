@@ -14,16 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore upstream binary files
+      - name: Verify binary assets present
         run: |
-          # This repo carries only text sources (GitHub push API rejects binaries).
-          # Binary assets (icons, MediaRemoteAdapter framework, sounds) come from
-          # the upstream v2.7.3 tarball; our modified files already exist here
-          # and are kept (--ignore-existing).
-          curl -sSL -o /tmp/upstream.tar.gz https://codeload.github.com/TheBoredTeam/boring.notch/tarball/refs/tags/v2.7.3
-          mkdir -p /tmp/upstream
-          tar xzf /tmp/upstream.tar.gz -C /tmp/upstream --strip-components=1
-          rsync -a --ignore-existing /tmp/upstream/ ./
+          # Binaries (icons, MediaRemoteAdapter framework, sounds) are committed
+          # in this repo from the Mac git push, so no download is needed.
           test -f mediaremote-adapter/MediaRemoteAdapter.framework/Versions/A/MediaRemoteAdapter
           test -d boringNotch/Assets.xcassets
 
