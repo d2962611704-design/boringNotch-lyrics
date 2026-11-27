@@ -182,6 +182,26 @@ struct MusicControlsView: View {
         .padding(.leading, 5)
     }
 
+    /// Karaoke gradient stops for a fill amount (0...1), computed outside the
+    /// ViewBuilder. The stops stay in non-decreasing location order for any
+    /// fill: white from 0 to the fill point, a short feather into gray, gray
+    /// to the end of the line.
+    private func karaokeStops(fill: CGFloat, unsung: Color) -> [Gradient.Stop] {
+        let f = min(max(fill, 0), 1)
+        var stops: [Gradient.Stop] = [Gradient.Stop(color: .white, location: 0)]
+        if f > 0 {
+            stops.append(Gradient.Stop(color: .white, location: f))
+        }
+        let featherEnd = min(1, f + 0.02)
+        if featherEnd > f {
+            stops.append(Gradient.Stop(color: unsung, location: featherEnd))
+        }
+        if featherEnd < 1 {
+            stops.append(Gradient.Stop(color: unsung, location: 1))
+        }
+        return stops
+    }
+
     private func songInfo(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             MarqueeText(
@@ -216,17 +236,10 @@ struct MusicControlsView: View {
                         let unsung = Color.gray.opacity(0.45)
                         // Gradient stops are built in non-decreasing location order for any f:
                         // white from 0 to f, then a short feather into gray, gray to 1.
-                        var stops: [Gradient.Stop] = [Gradient.Stop(color: .white, location: 0)]
-                        if f > 0 {
-                            stops.append(Gradient.Stop(color: .white, location: f))
-                        }
-                        let featherEnd = min(1, f + 0.02)
-                        if featherEnd > f {
-                            stops.append(Gradient.Stop(color: unsung, location: featherEnd))
-                        }
-                        if featherEnd < 1 {
-                            stops.append(Gradient.Stop(color: unsung, location: 1))
-                        }
+                        // Built via a helper outside the ViewBuilder: `stops.append(...)`
+                        // statements are not View expressions, so they cannot live inside
+                        // a TimelineView closure (that was the build 6 compile failure).
+                        let stops = karaokeStops(fill: f, unsung: unsung)
                         // The gradient must map to the text's own width, not the row's: a
                         // full-width frame on the Text itself would stretch the gradient
                         // across the whole row and the fill would run ahead of the singing.
