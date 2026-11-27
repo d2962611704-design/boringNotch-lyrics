@@ -23,7 +23,7 @@ jobs:
 
       - name: Build
         run: |
-          xcodebuild -project boringNotch.xcodeproj -target boringNotch -configuration Release -derivedDataPath build CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" build
+          xcodebuild -project boringNotch.xcodeproj -scheme boringNotch -configuration Release -derivedDataPath build CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" build
 
       - name: Package
         run: |
